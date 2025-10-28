@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Packaging / build
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Logs & data artifacts (keep code clean)
+*.log
+*.csv
+*.pkl
+*.pickle
+
+# Project-specific run artifacts
+optimizer.pkl
+hydro_history.csv
+history.csv
+GENERATED_FILES/
+
+# Jupyter
+.ipynb_checkpoints/
