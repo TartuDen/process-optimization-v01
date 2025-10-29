@@ -1,28 +1,26 @@
+# optimize_hydrogenation.py  (rpm added as a factor)
 import ProcessOptimizer as po
-from ProcessOptimizer.space import Real
+from ProcessOptimizer.space import Real  # use Integer if rpm has discrete steps
 import pickle, csv
 from pathlib import Path
 
 # ===================== USER TUNABLES =====================
-# Scale constants for your current batch (used only for logging/intuition)
-SUBSTRATE_G = 11.0           # grams of IP.4
-DEFAULT_STIR_RPM = 300       # if you keep it constant, it's meta-info only
+SUBSTRATE_G = 11.0
 
-# Factor space (bounds chosen to stay near your current recipe but allow useful moves)
 SPACE = po.Space([
-    Real(70.0, 95.0,   name="T_C"),          # °C
-    Real(10.0, 25.0,   name="H2_bar"),       # hydrogen pressure, bar
-    Real(6.0,  24.0,   name="time_h"),       # hours
-    Real(5.0,  15.0,   name="PdC_wtpc"),     # wt% 10% Pd/C vs substrate (as "wet" basis)
-    Real(0.30, 0.70,   name="MSA_frac"),     # MSA mass fraction in MSA/water (w/w)
-    Real(10.0, 30.0,   name="solv_mL_per_g") # total solvent volume per gram substrate
+    Real(70.0, 95.0,   name="T_C"),            # °C
+    Real(10.0, 25.0,   name="H2_bar"),         # bar
+    Real(6.0,  24.0,   name="time_h"),         # h
+    Real(5.0,  15.0,   name="PdC_wtpc"),       # wt% 10% Pd/C vs substrate (wet)
+    Real(0.30, 0.70,   name="MSA_frac"),       # MSA mass fraction (w/w)
+    Real(10.0, 30.0,   name="solv_mL_per_g"),  # mL/g substrate
+    Real(200.0, 400.0, name="rpm")             # stirring speed
 ])
 
-# Objective weights (sum ≈ 1). We MINIMIZE this loss.
-# Heavier emphasis on RRT 1.19 + 1.20 (you can tweak after a few runs):
-W_RRT      = 0.60   # weight on (RRT1.19 + RRT1.20)
-W_OFFSPEC  = 0.25   # penalty for (100 - purity)
-W_YIELD    = 0.15   # penalty for (100 - isolated_yield)
+# Single-objective loss (MINIMIZE)
+W_RRT      = 0.60
+W_OFFSPEC  = 0.25
+W_YIELD    = 0.15
 # =========================================================
 
 HISTORY = Path("hydro_history.csv")
@@ -31,15 +29,8 @@ STATE   = Path("optimizer.pkl")
 def load_or_init_optimizer():
     if STATE.exists():
         with open(STATE, "rb") as f:
-            opt = pickle.load(f)
-    else:
-        opt = po.Optimizer(
-            SPACE,
-            base_estimator="GP",
-            n_initial_points=5,
-            acq_func="EI",
-        )
-    return opt
+            return pickle.load(f)
+    return po.Optimizer(SPACE, base_estimator="GP", n_initial_points=5, acq_func="EI")
 
 def warm_start(opt):
     if not HISTORY.exists():
@@ -48,37 +39,42 @@ def warm_start(opt):
     with open(HISTORY, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            x = [float(row[n]) for n in ["T_C","H2_bar","time_h","PdC_wtpc","MSA_frac","solv_mL_per_g"]]
-            loss = float(row["loss"])
-            X.append(x); y.append(loss)
+            x = [float(row[n]) for n in [
+                "T_C","H2_bar","time_h","PdC_wtpc","MSA_frac","solv_mL_per_g","rpm"
+            ]]
+            X.append(x)
+            y.append(float(row["loss"]))
     if X:
         opt.tell(X, y)
 
 def respects_constraints(x):
-    T_C, H2_bar, time_h, PdC_wtpc, MSA_frac, solv_mL_per_g = x
-    # Example feasibility/safety sanity checks; edit to your SOPs
-    if T_C > 95.0 or T_C < 70.0: return False
-    if H2_bar < 8.0 or H2_bar > 30.0: return False
-    if time_h < 2.0 or time_h > 30.0: return False
-    if PdC_wtpc < 3.0 or PdC_wtpc > 20.0: return False
-    if MSA_frac < 0.25 or MSA_frac > 0.80: return False
-    if solv_mL_per_g < 8.0 or solv_mL_per_g > 40.0: return False
-    # Gentle interaction rule example: very high T with very high acid → avoid
-    if T_C > 92.0 and MSA_frac > 0.6: return False
+    T_C, H2_bar, time_h, PdC_wtpc, MSA_frac, solv_mL_per_g, rpm = x
+    # base bounds (belt & suspenders with Space bounds)
+    if not (70.0 <= T_C <= 95.0): return False
+    if not (10.0 <= H2_bar <= 25.0): return False
+    if not (6.0  <= time_h <= 24.0): return False
+    if not (5.0  <= PdC_wtpc <= 15.0): return False
+    if not (0.30 <= MSA_frac <= 0.70): return False
+    if not (10.0 <= solv_mL_per_g <= 30.0): return False
+    if not (200.0 <= rpm <= 400.0): return False
+
+    # example interaction guards (tweak to your SOPs):
+    if T_C > 92.0 and MSA_frac > 0.60:
+        return False
+    # if you observe attrition/foaming at high rpm + high gas load, guard here:
+    # if rpm > 380 and H2_bar > 22: return False
+
     return True
 
 def ask_feasible(opt):
-    x = opt.ask()
-    # Try a few times to hit a feasible point (GP + bounds usually OK)
-    for _ in range(20):
+    for _ in range(25):
+        x = opt.ask()
         if respects_constraints(x):
             return x
-        x = opt.ask()
-    return x  # last resort
+    return x  # fallback
 
 def compute_loss(hplc_purity_pct, rrt119_pct, rrt120_pct, isolated_yield_pct):
-    # All inputs expected as percentages 0..100
-    offspec = max(0.0, 100.0 - hplc_purity_pct)   # penalty if purity < 100
+    offspec   = max(0.0, 100.0 - hplc_purity_pct)
     yield_pen = max(0.0, 100.0 - isolated_yield_pct)
     return (W_RRT * (rrt119_pct + rrt120_pct)
             + W_OFFSPEC * offspec
@@ -86,9 +82,8 @@ def compute_loss(hplc_purity_pct, rrt119_pct, rrt120_pct, isolated_yield_pct):
 
 def append_history(row_dict):
     header = [
-        "T_C","H2_bar","time_h","PdC_wtpc","MSA_frac","solv_mL_per_g",
-        "calc_total_mL","hplc_purity_pct","rrt119_pct","rrt120_pct",
-        "isolated_yield_pct","loss"
+        "T_C","H2_bar","time_h","PdC_wtpc","MSA_frac","solv_mL_per_g","rpm",
+        "calc_total_mL","hplc_purity_pct","rrt119_pct","rrt120_pct","isolated_yield_pct","loss"
     ]
     is_new = not HISTORY.exists()
     with open(HISTORY, "a", newline="", encoding="utf-8") as f:
@@ -100,44 +95,41 @@ def main():
     opt = load_or_init_optimizer()
     warm_start(opt)
 
-    # === Suggest next run ===
     x = ask_feasible(opt)
-    T_C, H2_bar, time_h, PdC_wtpc, MSA_frac, solv_mL_per_g = x
+    T_C, H2_bar, time_h, PdC_wtpc, MSA_frac, solv_mL_per_g, rpm = x
     calc_total_mL = solv_mL_per_g * SUBSTRATE_G
 
     print("\n=== Suggested hydrogenation conditions ===")
-    print(f"Substrate: {SUBSTRATE_G:.2f} g IP.4    (stir {DEFAULT_STIR_RPM} rpm if constant)")
-    print(f"T         : {T_C:.1f} °C")
-    print(f"H2        : {H2_bar:.1f} bar")
-    print(f"Time      : {time_h:.1f} h")
-    print(f"Pd/C      : {PdC_wtpc:.1f} wt% of substrate (10% Pd/C, wet)")
-    print(f"MSA frac  : {MSA_frac:.2f} (w/w in MSA/H2O)")
-    print(f"Solvent   : {solv_mL_per_g:.1f} mL per g substrate → total ≈ {calc_total_mL:.0f} mL")
+    print(f"Substrate   : {SUBSTRATE_G:.2f} g IP.4")
+    print(f"T           : {T_C:.1f} °C")
+    print(f"H2          : {H2_bar:.1f} bar")
+    print(f"Time        : {time_h:.1f} h")
+    print(f"Pd/C        : {PdC_wtpc:.1f} wt% of substrate (10% Pd/C, wet)")
+    print(f"MSA fraction: {MSA_frac:.2f} (w/w in MSA/H2O)")
+    print(f"Solvent     : {solv_mL_per_g:.1f} mL/g → total ≈ {calc_total_mL:.0f} mL")
+    print(f"Stir speed  : {rpm:.0f} rpm")
 
-    # === Enter measured outcomes after you run it ===
-    print("\nEnter measured outcomes (percentages). Use decimal numbers, e.g., 75.6")
+    print("\nEnter measured outcomes (percentages, e.g., 75.6)")
     def ask_float(label):
         while True:
-            try:
-                return float(input(f"{label}: ").strip())
-            except Exception:
-                print("Please enter a number, e.g., 75.6")
+            try: return float(input(f"{label}: ").strip())
+            except Exception: print("Please enter a number, e.g., 75.6")
 
-    hplc_purity_pct   = ask_float("HPLC purity of IP.5 (%)")
-    rrt119_pct        = ask_float("Impurity RRT 1.19 (%)")
-    rrt120_pct        = ask_float("Impurity RRT 1.20 (%)")
-    isolated_yield_pct= ask_float("Isolated yield (%)")
+    hplc_purity_pct    = ask_float("HPLC purity of IP.5 (%)")
+    rrt119_pct         = ask_float("Impurity RRT 1.19 (%)")
+    rrt120_pct         = ask_float("Impurity RRT 1.20 (%)")
+    isolated_yield_pct = ask_float("Isolated yield (%)")
 
     loss = compute_loss(hplc_purity_pct, rrt119_pct, rrt120_pct, isolated_yield_pct)
 
-    opt.tell([T_C, H2_bar, time_h, PdC_wtpc, MSA_frac, solv_mL_per_g], loss)
+    opt.tell([T_C, H2_bar, time_h, PdC_wtpc, MSA_frac, solv_mL_per_g, rpm], loss)
 
     with open(STATE, "wb") as f:
         pickle.dump(opt, f)
 
     append_history({
         "T_C":T_C, "H2_bar":H2_bar, "time_h":time_h, "PdC_wtpc":PdC_wtpc,
-        "MSA_frac":MSA_frac, "solv_mL_per_g":solv_mL_per_g,
+        "MSA_frac":MSA_frac, "solv_mL_per_g":solv_mL_per_g, "rpm": rpm,
         "calc_total_mL": calc_total_mL,
         "hplc_purity_pct": hplc_purity_pct,
         "rrt119_pct": rrt119_pct,
