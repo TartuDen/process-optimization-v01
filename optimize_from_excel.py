@@ -1,8 +1,14 @@
-# optimize_from_excel_pivot.py
-# Works with your 3-sheet workbook:
-# - TEMPLATE (ignored)
-# - SETUP: mixed sections (CONST / VAR / OUT / OPT) exactly as you showed
-# - RUNS: pivoted: "vars" block (rows=variable names) + "outputs" block (rows=output names), columns = experiments
+# optimize_from_excel.py
+# Excel-driven, human-in-the-loop optimization using ProcessOptimizer
+# - TEMPLATE sheet: ignored
+# - SETUP sheet: sections CONST / VAR / OUT / OPT (mixed blocks), tolerant to case/whitespace
+# - RUNS sheet: pivot layout:
+#       Row with "vars" in A1, experiment headers across row (B1..)
+#       Variable rows below ("NH2OH_eq", "Et3N_eq", ...), values per experiment column
+#       A row with "outputs"
+#       Output rows below (yield_pct, purity_pct, imp_..., ...), values per experiment column
+# - Suggestions are PRINTED TO CONSOLE ONLY (no Excel write).
+# - Missing 'loss' is computed when all outputs for a column are present and written back if file is not open.
 
 from pathlib import Path
 import pickle
@@ -10,169 +16,189 @@ import pandas as pd
 import ProcessOptimizer as po
 from ProcessOptimizer.space import Real, Integer, Categorical
 
-# --------- USER: set workbook path ----------
-EXCEL_PATH = Path("Excel/optimize_from_excel.xlsx")  # change to your file path
-STATE_PKL  = EXCEL_PATH.with_suffix(".pkl")          # state persisted per workbook
+# -------------------- CONFIG --------------------
+EXCEL_PATH = Path("opica_tp1_optimizer.xlsx")  # change path/name as needed
+STATE_PKL  = EXCEL_PATH.with_suffix(".pkl")          # persisted optimizer state per workbook
+# ------------------------------------------------
 
-# --------- SETUP parsing ----------
+# ---------- SETUP parsing (robust) ----------
 def read_setup(excel_path: Path):
     df = pd.read_excel(excel_path, sheet_name="SETUP").fillna("")
+    # normalize headers
+    df.columns = [str(c).strip().lower() for c in df.columns]
 
-    # constants
-    const = {}
-    for _, r in df[df["section"].astype(str).str.upper()=="CONST"].iterrows():
-        const[str(r["name"]).strip()] = r["value"]
+    def col_or(name, default_series=None):
+        return df[name] if name in df.columns else (default_series if default_series is not None else "")
 
-    # variables
-    vdf = df[df["section"].astype(str).str.upper()=="VAR"].copy()
+    # ---- constants
+    cdf = df[col_or("section").astype(str).str.strip().str.lower() == "const"].copy()
+    cdf.columns = [str(c).strip().lower() for c in cdf.columns]
+    constants = {}
+    if not cdf.empty:
+        for _, r in cdf.iterrows():
+            nm = str(r.get("name", "")).strip()
+            if nm:
+                constants[nm] = r.get("value", "")
+
+    # ---- variables
+    vdf = df[col_or("section").astype(str).str.strip().str.lower() == "var"].copy()
+    vdf.columns = [str(c).strip().lower() for c in vdf.columns]
+    # ensure columns exist
+    for need in ["name", "type", "low", "high", "choices", "unit", "active"]:
+        if need not in vdf.columns:
+            vdf[need] = ""
     vdf["name"] = vdf["name"].astype(str).str.strip()
     vdf["type"] = vdf["type"].astype(str).str.strip().str.capitalize()
-    vdf["unit"] = vdf.get("unit","")
-    if "active" in vdf:
-        vdf["active"] = vdf["active"].astype(str).str.upper().isin(["TRUE","1","YES","Y"])
-    else:
-        vdf["active"] = True
-    vdf = vdf[vdf["active"]==True]
+    vdf["unit"] = vdf["unit"].astype(str).str.strip()
+
+    def to_bool(x):
+        s = str(x).strip().lower()
+        return s in ["true", "1", "yes", "y", ""]  # default TRUE if blank
+    vdf["active"] = vdf["active"].apply(to_bool)
+    vdf = vdf[vdf["active"] == True]
 
     variables = []
     for _, r in vdf.iterrows():
-        t = r["type"]; name = r["name"]; unit = r.get("unit","")
-        if t == "Real":
-            variables.append({"type":"Real","name":name,"low":float(r["low"]),"high":float(r["high"]),"unit":unit})
-        elif t == "Integer":
-            variables.append({"type":"Integer","name":name,"low":int(float(r["low"])),"high":int(float(r["high"])),"unit":unit})
-        elif t == "Categorical":
-            choices = [c.strip() for c in str(r.get("choices","")).split(",") if c.strip()!=""]
+        name = r["name"]
+        vtype = r["type"] or "Real"
+        unit = r["unit"]
+        if vtype == "Categorical":
+            choices = [c.strip() for c in str(r.get("choices", "")).split(",") if c.strip() != ""]
             if not choices:
-                raise ValueError(f"Categorical var '{name}' needs choices in SETUP.")
-            variables.append({"type":"Categorical","name":name,"choices":choices,"unit":unit})
-        else:
-            raise ValueError(f"Unknown var type '{t}' for '{name}'")
+                raise ValueError(f"Categorical var '{name}' needs 'choices' in SETUP.")
+            variables.append({"type": "Categorical", "name": name, "choices": choices, "unit": unit})
+        elif vtype == "Integer":
+            try:
+                lo = int(float(r.get("low", 0)))
+                hi = int(float(r.get("high", 0)))
+            except Exception:
+                raise ValueError(f"Integer var '{name}' needs numeric low/high.")
+            variables.append({"type": "Integer", "name": name, "low": lo, "high": hi, "unit": unit})
+        else:  # Real (default)
+            try:
+                lo = float(r.get("low", 0.0))
+                hi = float(r.get("high", 0.0))
+            except Exception:
+                raise ValueError(f"Real var '{name}' needs numeric low/high.")
+            variables.append({"type": "Real", "name": name, "low": lo, "high": hi, "unit": unit})
 
-    # outputs
-    odf = df[df["section"].astype(str).str.upper()=="OUT"].copy()
+    # ---- outputs
+    odf = df[col_or("section").astype(str).str.strip().str.lower() == "out"].copy()
+    odf.columns = [str(c).strip().lower() for c in odf.columns]
+    for need in ["name", "kind", "target", "weight"]:
+        if need not in odf.columns:
+            odf[need] = ""
     odf["name"] = odf["name"].astype(str).str.strip()
-    odf["kind"] = odf["kind"].astype(str).str.lower().str.strip()
+    odf["kind"] = odf["kind"].astype(str).str.strip().str.lower().replace({"": "min"})
     outputs = []
     for _, r in odf.iterrows():
+        tgt = r.get("target", "")
         outputs.append({
             "name": r["name"],
-            "kind": r.get("kind","min"),
-            "target": float(r["target"]) if str(r.get("target","")).strip()!="" else 100.0,
-            "weight": float(r.get("weight",1.0)),
+            "kind": r.get("kind", "min"),
+            "target": float(tgt) if str(tgt).strip() != "" else 100.0,
+            "weight": float(r.get("weight", 1.0)),
         })
 
-    # options
-    opts = {"acq_func":"EI","n_initial_points":6,"batch_size":1,"diversity_eps":0.05}
-    optdf = df[df["section"].astype(str).str.upper()=="OPT"].copy()
+    # ---- options
+    opts = {"acq_func": "EI", "n_initial_points": 6, "batch_size": 1, "diversity_eps": 0.05}
+    optdf = df[col_or("section").astype(str).str.strip().str.lower() == "opt"].copy()
+    optdf.columns = [str(c).strip().lower() for c in optdf.columns]
     for _, r in optdf.iterrows():
-        n = str(r["name"]).strip().lower()
-        v = r["value"]
-        if n in ["n_initial_points","batch_size"]:
-            opts[n] = int(v)
-        elif n in ["diversity_eps"]:
-            opts[n] = float(v)
-        elif n == "acq_func":
-            opts[n] = str(v)
+        n = str(r.get("name", "")).strip().lower()
+        v = r.get("value", "")
+        if n == "acq_func":
+            opts["acq_func"] = str(v)
+        elif n == "n_initial_points":
+            opts["n_initial_points"] = int(float(v))
+        elif n == "batch_size":
+            opts["batch_size"] = int(float(v))
+        elif n == "diversity_eps":
+            opts["diversity_eps"] = float(v)
 
-    return const, variables, outputs, opts
+    return constants, variables, outputs, opts
 
-# --------- RUNS pivot parsing ----------
+# ---------- RUNS (pivot) parsing ----------
 def read_runs_pivot(excel_path: Path):
     """
     Returns:
-      experiments: list of dicts {<var1>:..., <var2>:..., <out1>:..., ...}
-      cols: list of experiment column names
-      frames: (vars_block_df, outs_block_df) for possible writing back
+      experiments: list of dicts (variables + any available outputs) per experiment col
+      exp_col_names: user-visible column headers on the 'vars' header row
     """
     df = pd.read_excel(excel_path, sheet_name="RUNS", header=None)
     if df.empty:
-        return [], [], (None, None)
+        return [], []
 
-    # locate 'vars' row
-    vars_row_idx = df.index[df.iloc[:,0].astype(str).str.lower()=="vars"]
-    if len(vars_row_idx)==0:
-        # empty / not set up yet
-        return [], [], (None, None)
+    # find 'vars' row
+    vars_row_idx = df.index[df.iloc[:, 0].astype(str).str.strip().str.lower() == "vars"]
+    if len(vars_row_idx) == 0:
+        return [], []
     vars_row = vars_row_idx[0]
 
-    # rows for variables start at vars_row+1 until we hit blank or 'outputs'
+    # collect variable rows
     r = vars_row + 1
     var_rows = []
     while r < len(df):
-        first = str(df.iloc[r,0]).strip()
-        if first=="" or first.lower()=="outputs":
+        first = str(df.iloc[r, 0]).strip()
+        if first == "" or first.lower() == "outputs":
             break
         var_rows.append(r)
         r += 1
 
-    # 'outputs' row
-    outs_header_row = df.index[df.iloc[:,0].astype(str).str.lower()=="outputs"]
-    if len(outs_header_row):
-        outs_row = outs_header_row[0]
-        # outputs start at outs_row+1 until blank or end
+    # find 'outputs' row
+    outs_header_idx = df.index[df.iloc[:, 0].astype(str).str.strip().str.lower() == "outputs"]
+    out_rows = []
+    outs_row = None
+    if len(outs_header_idx):
+        outs_row = outs_header_idx[0]
         r2 = outs_row + 1
-        out_rows = []
         while r2 < len(df):
-            first = str(df.iloc[r2,0]).strip()
-            if first=="":
+            first = str(df.iloc[r2, 0]).strip()
+            if first == "":
                 break
             out_rows.append(r2)
             r2 += 1
-    else:
-        out_rows = []
 
-    # experiments columns are from column 1 onwards where headers look like 'experiment #1' etc — we just take all non-empty
-    # we will keep column labels as-is (from the header lines: on vars row, df.iloc[vars_row, 1:])
+    # experiment columns (headers are on the vars header row)
     exp_cols = []
     for j in range(1, df.shape[1]):
-        header_val = str(df.iloc[vars_row, j]).strip()
-        if header_val != "":
-            exp_cols.append((j, header_val))
+        hdr = str(df.iloc[vars_row, j]).strip()
+        if hdr != "":
+            exp_cols.append((j, hdr))
 
-    # build list of experiments dicts
     experiments = []
-    for (j, colname) in exp_cols:
+    for (j, _hdr) in exp_cols:
         e = {}
-        # vars
-        for r in var_rows:
-            key = str(df.iloc[r,0]).strip()
-            val = df.iloc[r, j]
-            if pd.isna(val) or str(val).strip()=="":
-                # missing variable value — skip this experiment entirely
-                e = None; break
+        # variables
+        bad = False
+        for rr in var_rows:
+            key = str(df.iloc[rr, 0]).strip()
+            val = df.iloc[rr, j]
+            if pd.isna(val) or str(val).strip() == "":
+                bad = True
+                break
             e[key] = val
-        if e is None:
+        if bad:
             continue
-        # outputs (optional; it's fine if blank)
-        for r in out_rows:
-            key = str(df.iloc[r,0]).strip()
-            val = df.iloc[r, j]
-            if pd.isna(val) or str(val).strip()=="":
-                # leave absent; we compute loss only if all outputs present
+        # outputs (optional; OK if missing)
+        for rr in out_rows:
+            key = str(df.iloc[rr, 0]).strip()
+            val = df.iloc[rr, j]
+            if pd.isna(val) or str(val).strip() == "":
                 continue
             e[key] = val
-        e["_exp_col_index"] = j    # keep excel column index for potential write-back
         experiments.append(e)
 
-    # store the blocks for writing back loss later (we’ll create a 'loss' row under outputs if missing)
-    vars_block = df.iloc[[vars_row]+var_rows, :].copy()
-    outs_block = None
-    if len(out_rows)>0:
-        outs_block = df.iloc[[outs_header_row[0]]+out_rows, :].copy()
-    else:
-        outs_block = pd.DataFrame()
+    return experiments, [c for _, c in exp_cols]
 
-    return experiments, [c for _, c in exp_cols], (vars_block, outs_block)
-
-# --------- Loss and space helpers ----------
+# ---------- Loss & space helpers ----------
 def compute_loss(outputs_cfg, row_dict):
-    # returns float or None if some outputs are missing
     total = 0.0
     for cfg in outputs_cfg:
-        n = cfg["name"]; kind = cfg.get("kind","min")
-        w = float(cfg.get("weight",1.0))
-        tgt = float(cfg.get("target",100.0))
+        n = cfg["name"]
+        kind = cfg.get("kind", "min")
+        w = float(cfg.get("weight", 1.0))
+        tgt = float(cfg.get("target", 100.0))
         if n not in row_dict:
             return None
         try:
@@ -187,38 +213,37 @@ def compute_loss(outputs_cfg, row_dict):
             pen = abs(val - tgt)
         else:
             raise ValueError(f"Unknown kind '{kind}' for output '{n}'")
-        total += w*pen
+        total += w * pen
     return total
 
 def build_space(variables):
     dims = []
     for v in variables:
-        t = v["type"]
-        if t == "Real":
+        if v["type"] == "Real":
             dims.append(Real(v["low"], v["high"], name=v["name"]))
-        elif t == "Integer":
+        elif v["type"] == "Integer":
             dims.append(Integer(v["low"], v["high"], name=v["name"]))
-        elif t == "Categorical":
+        elif v["type"] == "Categorical":
             dims.append(Categorical(v["choices"], name=v["name"]))
     return po.Space(dims)
 
 def vec_to_named(x_vec, variables):
     out = {}
     for i, v in enumerate(variables):
-        name, t = v["name"], v["type"]
+        t = v["type"]; n = v["name"]
         if t == "Categorical":
-            out[name] = x_vec[i]
+            out[n] = x_vec[i]
         elif t == "Real":
-            out[name] = float(x_vec[i])
+            out[n] = float(x_vec[i])
         else:
-            out[name] = int(x_vec[i])
+            out[n] = int(x_vec[i])
     return out
 
 def normalized_distance(a, b, variables):
     num = 0.0; cnt = 0
     for v in variables:
-        name, t = v["name"], v["type"]
-        va, vb = a[name], b[name]
+        t = v["type"]; n = v["name"]
+        va, vb = a[n], b[n]
         if t == "Categorical":
             num += 0.0 if va == vb else 1.0
             cnt += 1
@@ -243,19 +268,18 @@ def ask_batch(opt, k, variables, diversity_eps):
         batch.append(xn)
     return batch or [vec_to_named(opt.ask(), variables)]
 
-# --------- Warm start from RUNS ----------
-def warmstart_from_runs_pivot(opt, experiments, variables, outputs_cfg):
+# ---------- Warm start ----------
+def warmstart_from_runs(opt, experiments, variables, outputs_cfg):
     if not experiments:
         return
-    var_names = [v["name"] for v in variables]
     for e in experiments:
-        # build X vector in variable order; skip experiment if any var missing
-        missing = False
+        # build X vector in variable order; skip if any var missing
         x = []
+        good = True
         for v in variables:
             name, t = v["name"], v["type"]
             if name not in e:
-                missing = True; break
+                good = False; break
             val = e[name]
             if t == "Categorical":
                 x.append(str(val))
@@ -263,103 +287,104 @@ def warmstart_from_runs_pivot(opt, experiments, variables, outputs_cfg):
                 x.append(float(val))
             else:
                 x.append(int(float(val)))
-        if missing:
+        if not good:
             continue
-        # build y (loss) only if outputs present
         y = compute_loss(outputs_cfg, e)
         if y is None:
             continue
         opt.tell(x, y)
 
-# --------- Write SUGGESTIONS sheet ----------
-def write_suggestions_sheet(excel_path: Path, suggestions):
-    if not suggestions:
-        return
-    df = pd.DataFrame(suggestions)
-    with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as wr:
-        df.to_excel(wr, sheet_name="SUGGESTIONS", index=False)
-
-# --------- Optional: write/append 'loss' row under outputs ----------
-def write_loss_into_runs(excel_path: Path, variables, outputs_cfg, experiments, cols):
+# ---------- Write/Update 'loss' row back into RUNS (pivot) ----------
+def write_loss_into_runs(excel_path: Path, outputs_cfg, variables):
     """
-    Adds/updates a 'loss' row under the 'outputs' block (pivot layout).
-    Only writes for experiments that have all outputs present.
+    Re-open RUNS and write a 'loss' row under outputs for columns where all outputs are present.
+    Safe if Excel is open: if file is locked, we just warn and skip writing.
     """
-    if not experiments:
-        return
-    # Load raw RUNS again to preserve formatting as much as possible
-    df = pd.read_excel(excel_path, sheet_name="RUNS", header=None)
-    # find outputs header row
-    outs_header_idx = df.index[df.iloc[:,0].astype(str).str.lower()=="outputs"]
-    if len(outs_header_idx)==0:
-        # create outputs header under current vars block end
-        # locate vars header and end
-        vars_header_idx = df.index[df.iloc[:,0].astype(str).str.lower()=="vars"]
-        if not len(vars_header_idx):
-            return
-        # find end of var rows
-        r = vars_header_idx[0] + 1
-        while r < len(df) and str(df.iloc[r,0]).strip() not in ["","outputs"]:
-            r += 1
-        # insert 'outputs' header + 'loss' (only) — we will not attempt to rebuild full outputs here
-        # safer: if no outputs exist, skip writing loss altogether
+    try:
+        df = pd.read_excel(excel_path, sheet_name="RUNS", header=None)
+    except Exception:
         return
 
-    # outputs block exists -> see if 'loss' row exists; if not, append at bottom
-    ob = outs_header_idx[0]
-    # collect out rows indices
-    r = ob + 1
-    out_rows = []
-    while r < len(df) and str(df.iloc[r,0]).strip() != "":
-        out_rows.append(r)
-        r += 1
-    # is there a 'loss' row?
-    loss_row_idx = None
-    for rr in out_rows:
-        if str(df.iloc[rr,0]).strip().lower() == "loss":
-            loss_row_idx = rr; break
-    if loss_row_idx is None:
-        # append one more row
-        loss_row_idx = r
-        # ensure df has that row
-        needed = loss_row_idx - (len(df)-1)
-        if needed > 0:
-            # pad with empty rows
-            for _ in range(needed):
-                df.loc[len(df)] = [None]*df.shape[1]
-        df.iloc[loss_row_idx, 0] = "loss"
+    if df.empty:
+        return
 
-    # map experiment col index by column header at vars header row
-    vars_header_idx = df.index[df.iloc[:,0].astype(str).str.lower()=="vars"]
-    if not len(vars_header_idx):
+    # locate vars header row
+    vars_header_idx = df.index[df.iloc[:, 0].astype(str).str.strip().str.lower() == "vars"]
+    if len(vars_header_idx) == 0:
         return
     vh = vars_header_idx[0]
-    exp_col_map = {}
-    for j in range(1, df.shape[1]):
-        hdr = str(df.iloc[vh, j]).strip()
-        if hdr:
-            exp_col_map[hdr] = j
 
-    # write loss values for experiments with full outputs
+    # gather variable and output rows
+    r = vh + 1
+    var_rows = []
+    while r < len(df):
+        first = str(df.iloc[r, 0]).strip()
+        if first == "" or first.lower() == "outputs":
+            break
+        var_rows.append(r)
+        r += 1
+
+    outs_header_idx = df.index[df.iloc[:, 0].astype(str).str.strip().str.lower() == "outputs"]
+    if len(outs_header_idx) == 0:
+        return
+    oh = outs_header_idx[0]
+    r2 = oh + 1
+    out_rows = []
+    while r2 < len(df):
+        first = str(df.iloc[r2, 0]).strip()
+        if first == "":
+            break
+        out_rows.append(r2)
+        r2 += 1
+
+    # find or create 'loss' row
+    loss_row_idx = None
+    for rr in out_rows:
+        if str(df.iloc[rr, 0]).strip().lower() == "loss":
+            loss_row_idx = rr; break
+    if loss_row_idx is None:
+        loss_row_idx = r2  # append at first blank after outputs
+        needed = loss_row_idx - (len(df) - 1)
+        if needed > 0:
+            for _ in range(needed):
+                df.loc[len(df)] = [None] * df.shape[1]
+        df.iloc[loss_row_idx, 0] = "loss"
+
+    # iterate experiment columns and compute loss where possible
     changed = False
-    for e in experiments:
-        y = compute_loss(outputs_cfg, e)
-        if y is None:
+    for j in range(1, df.shape[1]):
+        # skip empty experiment headers
+        hdr = str(df.iloc[vh, j]).strip()
+        if hdr == "":
             continue
-        # get experiment header (original col label)
-        # if your headers are "experiment #1" style, they’re already stored in cols list
-        # but we don't have the header text inside 'e' — we can map using stored column index during read
-        j = e.get("_exp_col_index", None)
-        if j is None:
+
+        row_dict = {}
+        # collect outputs
+        have_all = True
+        for rr in out_rows:
+            key = str(df.iloc[rr, 0]).strip()
+            val = df.iloc[rr, j]
+            if pd.isna(val) or str(val).strip() == "":
+                have_all = False
+                break
+            row_dict[key] = val
+        if not have_all:
+            continue
+
+        y = compute_loss(outputs_cfg, row_dict)
+        if y is None:
             continue
         df.iloc[loss_row_idx, j] = y
         changed = True
 
     if changed:
-        with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as wr:
-            df.to_excel(wr, sheet_name="RUNS", header=False, index=False)
+        try:
+            with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as wr:
+                df.to_excel(wr, sheet_name="RUNS", header=False, index=False)
+        except PermissionError:
+            print("[warn] Excel is open: couldn't write computed loss back to RUNS. Close Excel and re-run to save.")
 
-# --------- main ----------
+# ---------- main ----------
 def main():
     if not EXCEL_PATH.exists():
         raise SystemExit(f"Excel not found: {EXCEL_PATH}")
@@ -367,42 +392,41 @@ def main():
     constants, variables, outputs, opts = read_setup(EXCEL_PATH)
     space = build_space(variables)
 
-    # load RUNS (pivot)
-    experiments, exp_col_names, (vars_block, outs_block) = read_runs_pivot(EXCEL_PATH)
-
-    # init/warmstart
+    # load existing optimizer or create new
     if STATE_PKL.exists():
         with open(STATE_PKL, "rb") as f:
             opt = pickle.load(f)
     else:
-        opt = po.Optimizer(space, base_estimator="GP",
-                           n_initial_points=opts["n_initial_points"],
-                           acq_func=opts["acq_func"])
-    warmstart_from_runs_pivot(opt, experiments, variables, outputs)
+        opt = po.Optimizer(space,
+                          base_estimator="GP",
+                          n_initial_points=opts["n_initial_points"],
+                          acq_func=opts["acq_func"])
 
-    # ask next batch
+    # read runs (pivot), warmstart if outputs are present
+    experiments, exp_cols = read_runs_pivot(EXCEL_PATH)
+    warmstart_from_runs(opt, experiments, variables, outputs)
+
+    # propose next batch
     suggestions = ask_batch(opt, opts["batch_size"], variables, opts["diversity_eps"])
 
-    # print suggestions
+    # print suggestions to console
     print("\n=== Suggested conditions ===")
     for i, s in enumerate(suggestions, 1):
         print(f"\n-- Suggestion {i}/{len(suggestions)} --")
         for v in variables:
-            name, unit = v["name"], v.get("unit","")
-            print(f"{name:>22}: {s[name]} {unit}".rstrip())
+            name, unit = v["name"], v.get("unit", "")
+            print(f"{name:>24}: {s[name]} {unit}".rstrip())
 
-    # write suggestions sheet
-    write_suggestions_sheet(EXCEL_PATH, suggestions)
-
-    # persist state
+    # persist optimizer state
     with open(STATE_PKL, "wb") as f:
         pickle.dump(opt, f)
 
-    # write/update 'loss' row in RUNS (if outputs are present)
-    write_loss_into_runs(EXCEL_PATH, variables, outputs, experiments, exp_col_names)
+    # attempt to compute/write loss back to RUNS for fully-observed experiments
+    write_loss_into_runs(EXCEL_PATH, outputs, variables)
 
-    print(f"\nWrote {len(suggestions)} suggestion(s) to SUGGESTIONS sheet.")
-    print("Copy a row into RUNS (vars block) as a new experiment column, run it, fill outputs block; rerun this script.")
+    print(f"\nPrinted {len(suggestions)} suggestion(s).")
+    print("Copy one suggestion into a new experiment column under RUNS → vars, perform the run,")
+    print("then fill outputs. You can keep Excel open to read; close it if you want loss written back.")
 
 if __name__ == "__main__":
     main()
