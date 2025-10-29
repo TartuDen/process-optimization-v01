@@ -26,6 +26,7 @@ build/
 *.csv
 *.pkl
 *.pickle
+*.xlsx
 
 # Project-specific run artifacts
 optimizer.pkl

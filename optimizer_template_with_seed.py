@@ -29,20 +29,20 @@ CONSTANTS = {
 # 2) VARIABLES (define your search space)
 #   Choose simple names (letters/numbers/underscores) to keep CSV clean.
 VARIABLES = [
-    {"type": "Real",     "name": "T_C",        "low": 70.0, "high": 95.0, "unit": "°C"},
-    {"type": "Real",     "name": "time_h",     "low": 1.0,  "high": 24.0, "unit": "h"},
-    {"type": "Real",     "name": "reagent_eq", "low": 0.5,  "high": 3.0,  "unit": "equiv"},
-    {"type": "Integer",  "name": "rpm",        "low": 200,  "high": 400,  "unit": "rpm"},
-    {"type": "Categorical","name": "solvent",  "choices": ["MeOH","MeCN","IPA"]},
+    {"type": "Real", "name": "T_C", "low": 70.0, "high": 95.0, "unit": "°C"},
+    {"type": "Real", "name": "time_h", "low": 1.0, "high": 24.0, "unit": "h"},
+    {"type": "Real", "name": "reagent_eq", "low": 0.5, "high": 3.0, "unit": "equiv"},
+    {"type": "Integer", "name": "rpm", "low": 200, "high": 400, "unit": "rpm"},
+    {"type": "Categorical", "name": "solvent", "choices": ["MeOH", "MeCN", "IPA"]},
 ]
 
 # 3) OUTPUTS (you will type these after each experiment)
 #   kind: "min" (lower better), "max" (higher better), "target" (closer to target better)
 OUTPUTS = [
-    {"name": "yield_pct",  "kind": "max",    "target": 100.0, "weight": 0.25},
-    {"name": "purity_pct", "kind": "max",    "target": 100.0, "weight": 0.25},
-    {"name": "imp_A_pct",  "kind": "min",                     "weight": 0.30},
-    {"name": "imp_B_pct",  "kind": "min",                     "weight": 0.20},
+    {"name": "yield_pct", "kind": "max", "target": 100.0, "weight": 0.25},
+    {"name": "purity_pct", "kind": "max", "target": 100.0, "weight": 0.25},
+    {"name": "imp_A_pct", "kind": "min", "weight": 0.30},
+    {"name": "imp_B_pct", "kind": "min", "weight": 0.20},
 ]
 
 # 4) EMBEDDED PAST RUNS (optional) — add your previously-conducted experiments here.
@@ -63,17 +63,19 @@ EMBEDDED_PAST_RUNS = [
 # Optimizer & batching
 ACQ_FUNC = "EI"
 N_INITIAL_POINTS = 6
-BATCH_SIZE = 1               # set 3–6 to get multiple diverse suggestions per run
-DIVERSITY_EPS = 0.05         # min normalized distance between batch points (0..1)
+BATCH_SIZE = 1  # set 3–6 to get multiple diverse suggestions per run
+DIVERSITY_EPS = 0.05  # min normalized distance between batch points (0..1)
 
 # (Optional) constraints — disabled by default and safe if left empty
-ENABLE_CONSTRAINTS  = False
-STRICT_CONSTRAINTS  = False
+ENABLE_CONSTRAINTS = False
+STRICT_CONSTRAINTS = False
 VERBOSE_CONSTRAINTS = False
+
 
 def example_guard_discrete_rpm(x, const):
     rpm = x.get("rpm")
     return True if rpm is None else (int(rpm) % 25 == 0)
+
 
 CONSTRAINTS = [
     # example_guard_discrete_rpm,
@@ -81,7 +83,7 @@ CONSTRAINTS = [
 
 # Files
 HISTORY_CSV = Path("history.csv")
-STATE_PKL   = Path("optimizer.pkl")
+STATE_PKL = Path("optimizer.pkl")
 
 # ====================== END USER CONFIG =======================
 
@@ -101,6 +103,7 @@ def build_space(variables):
             raise ValueError(f"Unknown variable type: {t}")
     return po.Space(dims)
 
+
 SPACE = build_space(VARIABLES)
 
 
@@ -116,10 +119,12 @@ def vec_to_named(x_vec):
             out[name] = int(out[name])
     return out
 
+
 def compute_loss(outputs):
     total = 0.0
     for cfg in OUTPUTS:
-        n = cfg["name"]; kind = cfg.get("kind", "min")
+        n = cfg["name"]
+        kind = cfg.get("kind", "min")
         w = float(cfg.get("weight", 1.0))
         tgt = float(cfg.get("target", 100.0))
         if n not in outputs:
@@ -136,6 +141,7 @@ def compute_loss(outputs):
         total += w * pen
     return total
 
+
 def prompt_float(label):
     while True:
         try:
@@ -143,20 +149,26 @@ def prompt_float(label):
         except Exception:
             print("Please enter a number, e.g., 75.6")
 
+
 def prompt_outputs():
     print("\nEnter measured outcomes:")
     return {cfg["name"]: prompt_float(f"  {cfg['name']}") for cfg in OUTPUTS}
 
+
 def append_history(row):
     var_names = [v["name"] for v in VARIABLES]
     out_names = [o["name"] for o in OUTPUTS]
-    derived_keys = sorted([k for k in row.keys() if k not in var_names + out_names + ["loss"]])
+    derived_keys = sorted(
+        [k for k in row.keys() if k not in var_names + out_names + ["loss"]]
+    )
     header = var_names + derived_keys + out_names + ["loss"]
     new = not HISTORY_CSV.exists()
     with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=header)
-        if new: w.writeheader()
+        if new:
+            w.writeheader()
         w.writerow({k: row.get(k, "") for k in header})
+
 
 # ---- Safe constraints runner
 def run_constraints(x_dict):
@@ -167,26 +179,33 @@ def run_constraints(x_dict):
             ok = fn(x_dict, CONSTANTS)
         except KeyError as e:
             if STRICT_CONSTRAINTS:
-                if VERBOSE_CONSTRAINTS: print(f"[constraint FAIL missing key] {fn.__name__}: {e}")
+                if VERBOSE_CONSTRAINTS:
+                    print(f"[constraint FAIL missing key] {fn.__name__}: {e}")
                 return False
             else:
-                if VERBOSE_CONSTRAINTS: print(f"[constraint SKIP missing key] {fn.__name__}: {e}")
+                if VERBOSE_CONSTRAINTS:
+                    print(f"[constraint SKIP missing key] {fn.__name__}: {e}")
                 continue
         except Exception as e:
             if STRICT_CONSTRAINTS:
-                if VERBOSE_CONSTRAINTS: print(f"[constraint FAIL error] {fn.__name__}: {e}")
+                if VERBOSE_CONSTRAINTS:
+                    print(f"[constraint FAIL error] {fn.__name__}: {e}")
                 return False
             else:
-                if VERBOSE_CONSTRAINTS: print(f"[constraint SKIP error] {fn.__name__}: {e}")
+                if VERBOSE_CONSTRAINTS:
+                    print(f"[constraint SKIP error] {fn.__name__}: {e}")
                 continue
         if not ok:
-            if VERBOSE_CONSTRAINTS: print(f"[constraint REJECT] {fn.__name__}")
+            if VERBOSE_CONSTRAINTS:
+                print(f"[constraint REJECT] {fn.__name__}")
             return False
     return True
 
+
 # ---- Diversity metric for batch selection
 def normalized_distance(a, b):
-    num = 0.0; cnt = 0
+    num = 0.0
+    cnt = 0
     for v in VARIABLES:
         name, t = v["name"], v["type"]
         va, vb = a[name], b[name]
@@ -195,10 +214,12 @@ def normalized_distance(a, b):
             cnt += 1
         else:
             span = float(v["high"] - v["low"])
-            if span <= 0: continue
+            if span <= 0:
+                continue
             num += abs((float(va) - float(vb)) / span)
             cnt += 1
     return num / max(cnt, 1)
+
 
 def ask_batch(opt, k):
     if k <= 1:
@@ -212,20 +233,26 @@ def ask_batch(opt, k):
     while len(batch) < k and tries < 500:
         xn = vec_to_named(opt.ask())
         if not run_constraints(xn):
-            tries += 1; continue
+            tries += 1
+            continue
         if batch:
             dmin = min(normalized_distance(xn, b) for b in batch)
             if dmin < DIVERSITY_EPS:
-                tries += 1; continue
+                tries += 1
+                continue
         batch.append(xn)
     return batch or [vec_to_named(opt.ask())]
+
 
 # ---- Persistence
 def load_or_init_optimizer():
     if STATE_PKL.exists():
         with open(STATE_PKL, "rb") as f:
             return pickle.load(f)
-    return po.Optimizer(SPACE, base_estimator="GP", n_initial_points=N_INITIAL_POINTS, acq_func=ACQ_FUNC)
+    return po.Optimizer(
+        SPACE, base_estimator="GP", n_initial_points=N_INITIAL_POINTS, acq_func=ACQ_FUNC
+    )
+
 
 def warm_start(opt):
     if not HISTORY_CSV.exists():
@@ -240,19 +267,24 @@ def warm_start(opt):
                     name, t = v["name"], v["type"]
                     val = row.get(name, "")
                     if val == "":
-                        x = None; break
+                        x = None
+                        break
                     if t == "Categorical":
                         x.append(val)
                     elif t == "Real":
                         x.append(float(val))
                     else:
                         x.append(int(float(val)))
-                if x is None: continue
+                if x is None:
+                    continue
                 if "loss" in row and row["loss"] not in ("", None):
-                    X.append(x); y.append(float(row["loss"]))
-            if X: opt.tell(X, y)
+                    X.append(x)
+                    y.append(float(row["loss"]))
+            if X:
+                opt.tell(X, y)
     except Exception:
         pass
+
 
 # ---- Embedded seeding with de-duplication
 def _key_from_vars(var_dict, decimals=8):
@@ -269,6 +301,7 @@ def _key_from_vars(var_dict, decimals=8):
             key.append(("I", int(val)))
     return tuple(key)
 
+
 def _existing_keys_from_history():
     keys = set()
     if not HISTORY_CSV.exists():
@@ -281,7 +314,8 @@ def _existing_keys_from_history():
             for v in VARIABLES:
                 name, t = v["name"], v["type"]
                 if row.get(name, "") == "":
-                    present = False; break
+                    present = False
+                    break
                 if t == "Categorical":
                     vd[name] = row[name]
                 elif t == "Real":
@@ -291,6 +325,7 @@ def _existing_keys_from_history():
             if present:
                 keys.add(_key_from_vars(vd))
     return keys
+
 
 def seed_embedded_runs():
     """Append embedded runs once; skip duplicates based on VARIABLES only."""
@@ -338,6 +373,7 @@ def seed_embedded_runs():
             pickle.dump(opt, f)
     return added
 
+
 # -------- MAIN
 def main():
     # 1) Seed embedded runs once (de-duplicated)
@@ -369,7 +405,11 @@ def main():
         x_vec = []
         for v in VARIABLES:
             name, t = v["name"], v["type"]
-            x_vec.append(s[name] if t == "Categorical" else (float(s[name]) if t == "Real" else int(s[name])))
+            x_vec.append(
+                s[name]
+                if t == "Categorical"
+                else (float(s[name]) if t == "Real" else int(s[name]))
+            )
         opt.tell(x_vec, loss)
         with open(STATE_PKL, "wb") as f:
             pickle.dump(opt, f)
@@ -386,6 +426,7 @@ def main():
         print(f"  loss* = {res.fun:.4f}")
 
     print("\nRun the script again to get the next suggestion batch.")
+
 
 if __name__ == "__main__":
     main()
