@@ -10,7 +10,7 @@
 #       Row "vars", then variable rows; row "outputs", then output rows; optional "loss" row.
 #       Experiments are columns (B..).
 #
-# Suggestions are printed to console.
+# Suggestions printed to console.
 # Loss values are COMPUTED and PRINTED to console (not written to Excel).
 
 from pathlib import Path
@@ -23,6 +23,7 @@ from ProcessOptimizer.space import Real, Integer, Categorical
 # -------------------- CONFIG --------------------
 EXCEL_PATH = Path("Excel/opica_tp4_optimizer.xlsx")  # adjust path/name
 STATE_PKL  = EXCEL_PATH.with_suffix(".pkl")
+VERBOSE_WARMSTART = True
 # ------------------------------------------------
 
 # ----------------- helpers ----------------------
@@ -147,11 +148,11 @@ def read_setup_opt(path: Path):
 # --------------- RUNS (pivot) reader ---------------
 def read_runs_pivot(path: Path):
     df = pd.read_excel(path, sheet_name="RUNS", header=None)
-    if df.empty: return [], [], []
+    if df.empty: return [], [], [], df
 
     # find 'vars' header row
     vars_header_idx = df.index[df.iloc[:,0].astype(str).str.strip().str.lower()=="vars"]
-    if len(vars_header_idx)==0: return [], [], []
+    if len(vars_header_idx)==0: return [], [], [], df
     vh = vars_header_idx[0]
 
     # variable rows
@@ -193,8 +194,8 @@ def read_runs_pivot(path: Path):
             if pd.isna(val) or str(val).strip() == "":
                 good = False; break
             e[key] = val
-        if not good: 
-            experiments.append(None)  # keep alignment with exp_cols
+        if not good:
+            experiments.append(None)  # keep alignment
             continue
         for rr in out_rows:
             key = str(df.iloc[rr,0]).strip()
@@ -205,7 +206,9 @@ def read_runs_pivot(path: Path):
             e[key] = val
         experiments.append(e)
 
-    return experiments, exp_cols, exp_names
+    # Also return the row indices of variables to inspect categorical values
+    var_names_order = [str(df.iloc[rr,0]).strip() for rr in var_rows]
+    return experiments, exp_cols, exp_names, df, var_names_order
 
 # --------------- loss & space -------------------
 def compute_loss(outputs_cfg, row_dict):
@@ -274,40 +277,102 @@ def ask_batch(opt, k, variables, diversity_eps):
         batch.append(xn)
     return batch or [vec_to_named(opt.ask(), variables)]
 
+# --------------- collect categorical values from RUNS ---------------
+def observed_categorical_values_from_runs(pdf, var_names_order):
+    """
+    Scans RUNS to collect actual string values seen for each variable name.
+    Returns dict: {var_name: set(values)} for rows that look non-numeric.
+    """
+    seen = {}
+    if pdf.empty or not var_names_order:
+        return seen
+
+    # map variable name -> row index in pdf
+    name_to_row = {}
+    for i in range(pdf.shape[0]):
+        label = str(pdf.iloc[i,0]).strip()
+        if label in var_names_order:
+            name_to_row[label] = i
+
+    # Find the 'vars' header row to know which columns are experiments
+    vars_header_idx = pdf.index[pdf.iloc[:,0].astype(str).str.strip().str.lower()=="vars"]
+    if len(vars_header_idx)==0:
+        return seen
+    vh = vars_header_idx[0]
+
+    exp_cols = [j for j in range(1, pdf.shape[1]) if str(pdf.iloc[vh, j]).strip() != ""]
+    for name in var_names_order:
+        r = name_to_row.get(name, None)
+        if r is None: continue
+        # Collect values that are clearly strings (categoricals) or mixed (non-numeric)
+        vals = set()
+        for j in exp_cols:
+            val = pdf.iloc[r, j]
+            if pd.isna(val) or str(val).strip() == "":
+                continue
+            # If value can't be parsed as number, treat as categorical token
+            if _num_from_cell(val) is None:
+                vals.add(str(val).strip())
+        if vals:
+            seen[name] = vals
+    return seen
+
 # --------------- warm start --------------------
 def warmstart_from_runs(opt, experiments, variables, outputs_cfg):
-    if not experiments: return
+    if not experiments: 
+        if VERBOSE_WARMSTART:
+            print("[warmstart] no experiment columns found.")
+        return
     fed = 0
-    for e in experiments:
-        if not e: 
+    for idx, e in enumerate(experiments, start=1):
+        if not e:
+            if VERBOSE_WARMSTART:
+                print(f"[warmstart] skip column {idx}: missing at least one variable value.")
             continue
         x, ok = [], True
         for v in variables:
             name, t = v["name"], v["type"]
-            if name not in e: ok = False; break
+            if name not in e:
+                ok = False
+                if VERBOSE_WARMSTART:
+                    print(f"[warmstart] skip column {idx}: variable '{name}' missing.")
+                break
             if t == "Categorical":
                 x.append(str(e[name]))
             elif t == "Real":
-                num = _num_from_cell(e[name]);   
-                if num is None: ok = False; break
+                num = _num_from_cell(e[name])
+                if num is None:
+                    ok = False
+                    if VERBOSE_WARMSTART:
+                        print(f"[warmstart] skip column {idx}: variable '{name}' is non-numeric.")
+                    break
                 x.append(num)
             else:
-                iv  = _int_from_cell(e[name]);   
-                if iv  is None: ok = False; break
+                iv  = _int_from_cell(e[name])
+                if iv  is None:
+                    ok = False
+                    if VERBOSE_WARMSTART:
+                        print(f"[warmstart] skip column {idx}: variable '{name}' is non-integer.")
+                    break
                 x.append(iv)
-        if not ok: continue
+        if not ok: 
+            continue
         y = compute_loss(outputs_cfg, e)
-        if y is None: continue
-        opt.tell(x, y); fed += 1
+        if y is None:
+            if VERBOSE_WARMSTART:
+                print(f"[warmstart] skip column {idx}: at least one output missing or non-numeric.")
+            continue
+        # Try feeding; if categorical out-of-domain, ProcessOptimizer/Skopt can error.
+        try:
+            opt.tell(x, y); fed += 1
+        except Exception as err:
+            if VERBOSE_WARMSTART:
+                print(f"[warmstart] skip column {idx}: opt.tell failed ({err}).")
+            continue
     print(f"[warmstart] fed {fed} completed run(s) into the optimizer.")
 
 # --------------- compute+print loss report ---------------
 def print_loss_report(path: Path, outputs_cfg):
-    """
-    Reads RUNS and prints a loss line per experiment column:
-      - experiment header
-      - loss value (if all outputs present), or a short reason why not computed
-    """
     df = pd.read_excel(path, sheet_name="RUNS", header=None)
     if df.empty:
         print("\n[loss] RUNS sheet is empty.")
@@ -374,13 +439,37 @@ def main():
     if not EXCEL_PATH.exists():
         sys.exit(f"Excel not found: {EXCEL_PATH}")
 
+    # Read setup
     constants = read_setup_const(EXCEL_PATH)
     variables = read_setup_var(EXCEL_PATH)
     outputs   = read_setup_out(EXCEL_PATH)
     opts      = read_setup_opt(EXCEL_PATH)
 
+    # Read RUNS early to discover categorical values actually used (e.g., 'precipitation')
+    experiments, _, _, runs_df, var_names_order = read_runs_pivot(EXCEL_PATH)
+
+    # Auto-union categorical choices with observed tokens in RUNS
+    observed = observed_categorical_values_from_runs(runs_df, var_names_order)
+    changed_any = False
+    for v in variables:
+        if v["type"] == "Categorical":
+            name = v["name"]
+            seen_vals = set([c.strip() for c in v["choices"]])
+            extra = set()
+            if name in observed:
+                for tok in observed[name]:
+                    if tok not in seen_vals:
+                        extra.add(tok)
+            if extra:
+                v["choices"] = list(seen_vals.union(extra))
+                changed_any = True
+                print(f"[setup] extended categorical '{name}' choices with values from RUNS: {sorted(list(extra))}")
+    if changed_any:
+        print("[setup] categorical spaces updated to include all values seen in RUNS.")
+    # Build space after union
     space = build_space(variables)
 
+    # Load/init optimizer
     if STATE_PKL.exists():
         with open(STATE_PKL, "rb") as f:
             opt = pickle.load(f)
@@ -390,9 +479,10 @@ def main():
                            n_initial_points=opts["n_initial_points"],
                            acq_func=opts["acq_func"])
 
-    experiments, _, _ = read_runs_pivot(EXCEL_PATH)
+    # Warm start from RUNS (only columns with all outputs)
     warmstart_from_runs(opt, experiments, variables, outputs)
 
+    # Ask next suggestion(s)
     suggestions = ask_batch(opt, opts["batch_size"], variables, opts["diversity_eps"])
 
     print("\n=== Suggested conditions ===")
@@ -402,6 +492,7 @@ def main():
             name, unit = v["name"], v.get("unit","")
             print(f"{name:>24}: {s[name]} {unit}".rstrip())
 
+    # Persist optimizer state
     with open(STATE_PKL, "wb") as f:
         pickle.dump(opt, f)
 
@@ -411,6 +502,6 @@ def main():
     print(f"\nPrinted {len(suggestions)} suggestion(s).")
     print("Paste one suggestion into RUNS (new experiment column under 'vars'), run it, fill outputs, then re-run.")
     print("Copy the 'loss' values from the Loss report into the RUNS sheet manually.")
-    
+
 if __name__ == "__main__":
     main()
