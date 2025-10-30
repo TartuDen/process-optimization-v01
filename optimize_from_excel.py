@@ -36,8 +36,17 @@ import pandas as pd
 import ProcessOptimizer as po
 from ProcessOptimizer.space import Real, Integer, Categorical
 
+# plotting (non-interactive backend)
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # safe for headless runs
+    import matplotlib.pyplot as plt
+except Exception:
+    matplotlib = None
+    plt = None
+
 # -------------------- CONFIG --------------------
-EXCEL_PATH = Path("Excel/opica_tp4_optimizer.xlsx")  # adjust path/name
+EXCEL_PATH = Path("Excel/opica_tp1_optimizer.xlsx")  # adjust path/name
 STATE_PKL  = EXCEL_PATH.with_suffix(".pkl")
 VERBOSE_WARMSTART = True
 MAX_DIVERSITY_TRIES = 500
@@ -141,7 +150,17 @@ def read_setup_out(path: Path) -> List[Dict[str, Any]]:
 
 
 def read_setup_opt(path: Path) -> Dict[str, Any]:
-    """Read optimization options from SETUP‑OPT with robust header handling."""
+    """Read optimization options from SETUP‑OPT with robust header handling.
+
+    Recognized options (name → value):
+      - acq_func (str)
+      - n_initial_points (int)
+      - batch_size (int)
+      - diversity_eps (float)
+      - plot_objective (bool; default False)
+      - plot_path (str; default "objective.png")
+      - plot_dpi (int; default 150)
+    """
     df = pd.read_excel(path, sheet_name="SETUP-OPT").fillna("")
     try:
         _norm_cols_inplace(df)
@@ -155,7 +174,16 @@ def read_setup_opt(path: Path) -> Dict[str, Any]:
             df.columns = ["name","value"] + [f"extra_{i}" for i in range(2, df.shape[1])]
     _norm_cols_inplace(df)
 
-    opts: Dict[str, Any] = {"acq_func":"EI","n_initial_points":6,"batch_size":1,"diversity_eps":0.05}
+    opts: Dict[str, Any] = {
+        "acq_func": "EI",
+        "n_initial_points": 6,
+        "batch_size": 1,
+        "diversity_eps": 0.05,
+        # plotting
+        "plot_objective": False,
+        "plot_path": "objective.png",
+        "plot_dpi": 150,
+    }
     for _, r in df.iterrows():
         n = str(r.get("name", "")).strip().lower()
         v = r.get("value", "")
@@ -167,6 +195,12 @@ def read_setup_opt(path: Path) -> Dict[str, Any]:
             iv = _int_from_cell(v);  opts["batch_size"]       = iv if iv is not None else opts["batch_size"]
         elif n == "diversity_eps":
             fv = _num_from_cell(v);  opts["diversity_eps"]    = fv if fv is not None else opts["diversity_eps"]
+        elif n == "plot_objective":
+            opts["plot_objective"] = _as_bool(v, default=False)
+        elif n == "plot_path":
+            opts["plot_path"] = str(v).strip() or opts["plot_path"]
+        elif n == "plot_dpi":
+            iv = _int_from_cell(v);  opts["plot_dpi"] = iv if iv is not None else opts["plot_dpi"]
     return opts
 
 # --------------- RUNS (pivot) reader ---------------
@@ -536,6 +570,31 @@ def save_optimizer(opt: po.Optimizer, variables: Sequence[Dict[str, Any]]) -> No
 
 # ------------------ main -----------------------
 
+def _maybe_plot_objective(opt: po.Optimizer, opts: Dict[str, Any]) -> None:
+    """Optionally generate an objective plot from the current optimizer state.
+
+    Saves to opts['plot_path'] with dpi=opts['plot_dpi'] using a non-interactive backend.
+    """
+    if not opts.get("plot_objective", False):
+        return
+    if matplotlib is None or plt is None:
+        print("[plot] matplotlib unavailable; skipping plot_objective.")
+        return
+    try:
+        result = opt.get_result()
+        # ProcessOptimizer returns axes; grab current figure
+        po.plot_objective(result)
+        fig = plt.gcf()
+        out_path = Path(opts.get("plot_path", "objective.png"))
+        # If relative, drop next to the Excel file for convenience
+        if not out_path.is_absolute():
+            out_path = EXCEL_PATH.parent / out_path
+        fig.savefig(out_path, dpi=int(opts.get("plot_dpi", 150)), bbox_inches="tight")
+        plt.close(fig)
+        print(f"[plot] objective saved to: {out_path}")
+    except Exception as e:
+        print(f"[plot] failed to create objective plot: {e}")
+
 def main() -> None:
     if not EXCEL_PATH.exists():
         sys.exit(f"Excel not found: {EXCEL_PATH}")
@@ -571,6 +630,9 @@ def main() -> None:
 
     # Warm start from RUNS (only columns with all outputs)
     warmstart_from_runs(opt, experiments, variables, outputs)
+
+    # Optional objective plot of the current GP mean surface
+    _maybe_plot_objective(opt, opts)
 
     # Ask next suggestion(s)
     suggestions = ask_batch(opt, opts["batch_size"], variables, opts["diversity_eps"])
