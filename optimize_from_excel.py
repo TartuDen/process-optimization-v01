@@ -46,7 +46,7 @@ except Exception:
     plt = None
 
 # -------------------- CONFIG --------------------
-EXCEL_PATH = Path("Excel/opica_tp1_optimizer.xlsx")  # adjust path/name
+EXCEL_PATH = Path("Excel/opica_tp4_optimizer.xlsx")  # adjust path/name
 STATE_PKL  = EXCEL_PATH.with_suffix(".pkl")
 VERBOSE_WARMSTART = True
 MAX_DIVERSITY_TRIES = 500
