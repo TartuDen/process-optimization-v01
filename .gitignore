@@ -27,12 +27,14 @@ build/
 *.pkl
 *.pickle
 *.xlsx
+*.png
 
 # Project-specific run artifacts
 optimizer.pkl
 hydro_history.csv
 history.csv
 GENERATED_FILES/
+
 
 # Jupyter
 .ipynb_checkpoints/
